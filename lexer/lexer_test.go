@@ -129,6 +129,16 @@ func TestNewline(t *testing.T) {
 					EndColumn:   d.ec + 1,
 				},
 			})
+			testNextToken(t, l, token.Token{
+				Tag:   token.EOF,
+				Value: "",
+				Location: token.Location{
+					StartLine:   1,
+					StartColumn: d.ec + 1,
+					EndLine:     1,
+					EndColumn:   d.ec + 1,
+				},
+			})
 		})
 	}
 }

@@ -10,28 +10,17 @@ import (
 )
 
 type Lexer struct {
-	Line         int
-	Column       int
-	src          *bufio.Reader
-	isEOF        bool
-	savedRune    rune
-	hasSavedRune bool
-	prevLine     int
-	prevCol      int
-	nextLine     int
-	nextCol      int
-	lastTag      token.Tag
+	src      *bufio.Reader
+	pos      *position
+	saved    rune
+	hasSaved bool
+	lastTag  token.Tag
 }
 
 func New(src io.Reader) *Lexer {
 	return &Lexer{
-		Line:     1,
-		Column:   1,
-		src:      bufio.NewReader(src),
-		prevLine: 1,
-		prevCol:  1,
-		nextLine: 1,
-		nextCol:  1,
+		src: bufio.NewReader(src),
+		pos: newPosition(1),
 	}
 }
 
@@ -45,14 +34,7 @@ func (l *Lexer) NextToken() (t token.Token, err error) {
 
 	c, err := l.getc()
 	if err == io.EOF {
-		l.Column++
-		t.Tag = token.EOF
-		if l.isNewlineRequired() {
-			t.Tag = token.NEWLINE
-			t.Value = "\n"
-		}
-		l.copyLocation(&t.Location, &t.Location)
-		err = nil
+		err = l.scanEOF(&t)
 		return
 	}
 	if err != nil {
@@ -64,17 +46,7 @@ func (l *Lexer) NextToken() (t token.Token, err error) {
 	case c == '\n':
 		err = l.scanNewline(&t)
 	case c == '}':
-		if l.isNewlineRequired() {
-			l.ungetc(c)
-			t.Tag = token.NEWLINE
-			t.Value = "\n"
-			l.copyLocation(nil, &t.Location)
-			return
-		}
-		t.Tag = token.RBRACE
-		t.Value = "}"
-		l.copyLocation(nil, &t.Location)
-		return
+		err = l.scanRightBrace(&t)
 	case c == '"':
 		err = l.scanString(&t)
 	case c == '0':
@@ -119,9 +91,36 @@ func (l *Lexer) skipSpacesAndComments() error {
 	return nil
 }
 
+func (l *Lexer) scanEOF(t *token.Token) error {
+	t.Tag = token.EOF
+	if l.isNewlineRequired() {
+		t.Tag = token.NEWLINE
+		t.Value = "\n"
+	}
+	l.copyLocation(&t.Location, &t.Location)
+	// EOF は最後の文字の隣とここでは定義する
+	t.Location.StartColumn++
+	t.Location.EndColumn++
+	return nil
+}
+
 func (l *Lexer) scanNewline(t *token.Token) error {
 	t.Tag = token.NEWLINE
 	t.Value = "\n"
+	l.copyLocation(nil, &t.Location)
+	return nil
+}
+
+func (l *Lexer) scanRightBrace(t *token.Token) error {
+	if l.isNewlineRequired() {
+		l.ungetc('}')
+		t.Tag = token.NEWLINE
+		t.Value = "\n"
+		l.copyLocation(nil, &t.Location)
+		return nil
+	}
+	t.Tag = token.RBRACE
+	t.Value = "}"
 	l.copyLocation(nil, &t.Location)
 	return nil
 }
@@ -286,10 +285,11 @@ var operators = map[string]token.Tag{
 
 func (l *Lexer) scanOperator(t *token.Token, c rune) error {
 	buf := []rune{c}
+	if _, ok := operators[string(buf)]; !ok {
+		return fmt.Errorf("%v: invalid character - '%c'", t.Location, c)
+	}
+
 	for {
-		if _, ok := operators[string(buf)]; !ok {
-			break
-		}
 		c, err := l.getc()
 		if err == io.EOF {
 			break
@@ -298,24 +298,17 @@ func (l *Lexer) scanOperator(t *token.Token, c rune) error {
 			return err
 		}
 		buf = append(buf, c)
-	}
-	last := buf[len(buf)-1]
-	var s string
-	if l.isEOF {
-		s = string(buf)
-	} else {
-		s = string(buf[:len(buf)-1])
-	}
-	if tt, ok := operators[s]; ok {
-		if !l.isEOF {
-			l.ungetc(last)
+		if _, ok := operators[string(buf)]; !ok {
+			l.ungetc(c)
+			buf = buf[:len(buf)-1]
+			break
 		}
-		t.Tag = tt
-		t.Value = s
-		l.copyLocation(nil, &t.Location)
-		return nil
 	}
-	return fmt.Errorf("%v: invalid character - '%c'", t.Location, last)
+
+	t.Value = string(buf)
+	t.Tag = operators[t.Value]
+	l.copyLocation(nil, &t.Location)
+	return nil
 }
 
 func (l *Lexer) isNewlineRequired() bool {
@@ -352,52 +345,35 @@ func isSymbol(c rune) bool {
 
 func (l *Lexer) copyLocation(start *token.Location, end *token.Location) {
 	if start != nil {
-		start.StartLine = l.Line
-		start.StartColumn = l.Column
+		start.StartLine = l.pos.currentLine
+		start.StartColumn = l.pos.currentColumn
 	}
 	if end != nil {
-		end.EndLine = l.Line
-		end.EndColumn = l.Column
+		end.EndLine = l.pos.currentLine
+		end.EndColumn = l.pos.currentColumn
 	}
 }
 
-func (l *Lexer) getc() (rune, error) {
-	c, err := l.getcCore()
-	if err != nil {
-		return 0, err
+func (l *Lexer) getc() (c rune, err error) {
+	if l.hasSaved {
+		c = l.saved
+		l.hasSaved = false
+	} else {
+		c, _, err = l.src.ReadRune()
 	}
-	l.prevLine = l.Line
-	l.prevCol = l.Column
-	l.Line = l.nextLine
-	l.Column = l.nextCol
-	l.nextCol++
+	if err != nil {
+		return
+	}
 	if c == '\n' {
-		l.nextLine++
-		l.nextCol = 1
+		l.pos.newline()
+	} else {
+		l.pos.next()
 	}
-	return c, nil
-}
-
-func (l *Lexer) getcCore() (rune, error) {
-	if l.hasSavedRune {
-		l.hasSavedRune = false
-		return l.savedRune, nil
-	}
-	c, _, err := l.src.ReadRune()
-	if err != nil {
-		if err == io.EOF {
-			l.isEOF = true
-		}
-		return 0, err
-	}
-	return c, nil
+	return
 }
 
 func (l *Lexer) ungetc(c rune) {
-	l.savedRune = c
-	l.hasSavedRune = true
-	l.nextLine = l.Line
-	l.nextCol = l.Column
-	l.Line = l.prevLine
-	l.Column = l.prevCol
+	l.saved = c
+	l.hasSaved = true
+	l.pos.back()
 }
